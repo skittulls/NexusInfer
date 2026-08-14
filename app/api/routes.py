@@ -4,6 +4,9 @@ NexusInfer — API Route Handlers
 Defines all REST endpoints for the inference API.
 Routes are thin — they validate input, delegate to the job service,
 and format the response. No business logic lives here.
+
+Day 2: Jobs are now dispatched to Celery workers via Redis.
+       Falls back to synchronous execution if Redis is unavailable.
 """
 
 import time
@@ -30,6 +33,18 @@ router = APIRouter()
 _start_time = time.time()
 
 
+def _check_redis_connection() -> bool:
+    """Check if Redis is reachable for Celery broker."""
+    try:
+        import redis
+        settings = get_settings()
+        r = redis.Redis.from_url(settings.CELERY_BROKER_URL, socket_timeout=1)
+        r.ping()
+        return True
+    except Exception:
+        return False
+
+
 # ──────────────────────────── Health Check ────────────────────────────
 
 
@@ -42,8 +57,10 @@ _start_time = time.time()
 )
 async def health_check():
     settings = get_settings()
+    redis_ok = _check_redis_connection()
+
     return HealthResponse(
-        status="healthy",
+        status="healthy" if redis_ok else "degraded (Redis unavailable, sync mode)",
         version=settings.APP_VERSION,
         uptime_seconds=round(time.time() - _start_time, 2),
         jobs_in_queue=job_store.pending_count,
@@ -62,8 +79,8 @@ async def health_check():
     description=(
         "Submits a new ML inference job to the processing queue. "
         "Returns a job ID that can be used to poll for results. "
-        "In Day 1, inference runs synchronously; from Day 2 onwards, "
-        "jobs are dispatched to Celery workers via Redis."
+        "Jobs are dispatched to Celery workers via Redis. "
+        "Falls back to synchronous execution if Redis is unavailable."
     ),
 )
 async def submit_job(request: JobSubmitRequest):
@@ -71,9 +88,33 @@ async def submit_job(request: JobSubmitRequest):
     response = job_store.create_job(request)
     job_id = response.job_id
 
-    # 2. Day 1: Run inference synchronously (blocking).
-    #    Day 2+: This block is replaced with a Celery task dispatch:
-    #            celery_app.send_task("run_inference", args=[job_id])
+    # 2. Try async dispatch via Celery
+    if _check_redis_connection():
+        try:
+            from app.workers.tasks import run_inference_task
+
+            run_inference_task.apply_async(
+                args=[job_id, request.model_type.value, request.input_text],
+                queue="inference",
+                priority=request.priority,
+            )
+
+            response.message = (
+                f"Job queued for async processing. "
+                f"Model: {request.model_type.value}. "
+                f"Poll GET /api/v1/jobs/{job_id} for results."
+            )
+            logger.info(f"Job {job_id} dispatched to Celery (async)")
+            return response
+
+        except Exception as e:
+            logger.warning(
+                f"Celery dispatch failed for job {job_id}, "
+                f"falling back to sync: {e}"
+            )
+
+    # 3. Fallback: synchronous execution (no Redis / Celery unavailable)
+    logger.info(f"Job {job_id} executing synchronously (Redis unavailable)")
     try:
         job_store.update_status(job_id, JobStatus.PROCESSING)
 
@@ -83,11 +124,10 @@ async def submit_job(request: JobSubmitRequest):
 
         job_store.set_result(job_id, result, elapsed_ms)
 
-        # Update the response to reflect completion
         response.status = JobStatus.COMPLETED
         response.message = (
             f"Job completed synchronously in {elapsed_ms:.1f}ms. "
-            f"(Async dispatch available from Day 2)"
+            f"(Start Redis + Celery worker for async processing)"
         )
 
     except Exception as e:

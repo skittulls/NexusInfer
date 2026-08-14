@@ -32,18 +32,30 @@ async def lifespan(app: FastAPI):
     """
     Application lifespan handler.
 
-    Startup: Log configuration, pre-load resources.
+    Startup: Log configuration, verify external services.
     Shutdown: Graceful cleanup.
-
-    Day 2+: This is where we'll verify Redis connectivity.
-    Day 3+: This is where we'll pre-load ML models into memory.
-    Day 4+: This is where we'll initialize the DB connection pool.
     """
     settings = get_settings()
     logger.info("=" * 60)
     logger.info(f"  {settings.APP_NAME} v{settings.APP_VERSION}")
     logger.info(f"  Debug Mode: {settings.DEBUG}")
     logger.info(f"  Default Model: {settings.DEFAULT_MODEL}")
+    logger.info("=" * 60)
+
+    # ── Check Redis connectivity ──
+    try:
+        import redis
+        r = redis.Redis.from_url(settings.CELERY_BROKER_URL, socket_timeout=2)
+        r.ping()
+        logger.info(f"  Redis: CONNECTED ({settings.CELERY_BROKER_URL})")
+        logger.info("  Mode: ASYNC (Celery workers)")
+    except Exception as e:
+        logger.warning(f"  Redis: UNAVAILABLE ({e})")
+        logger.warning("  Mode: SYNC FALLBACK (jobs processed in-request)")
+        logger.warning("  → Start Redis: brew services start redis")
+        logger.warning("  → Start Worker: celery -A app.workers.celery_app worker "
+                       "--loglevel=info -Q inference")
+
     logger.info("=" * 60)
     logger.info("Starting up...")
 
@@ -69,7 +81,7 @@ def create_app() -> FastAPI:
         description=(
             "A production-grade, distributed AI inference API. "
             "Submit ML inference jobs via REST, which are dispatched to "
-            "background workers through a Redis-backed task queue. "
+            "background workers through a Redis-backed Celery task queue. "
             "Supports sentiment analysis, text summarization, and NER."
         ),
         version=settings.APP_VERSION,
