@@ -23,7 +23,7 @@ from app.schemas.job import (
     HealthResponse,
 )
 from app.services.job_service import job_store
-from app.services.inference import run_mock_inference
+from app.services.inference import run_inference
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -59,11 +59,15 @@ async def health_check():
     settings = get_settings()
     redis_ok = _check_redis_connection()
 
+    from app.services.model_manager import model_manager
+
     return HealthResponse(
         status="healthy" if redis_ok else "degraded (Redis unavailable, sync mode)",
         version=settings.APP_VERSION,
         uptime_seconds=round(time.time() - _start_time, 2),
         jobs_in_queue=job_store.pending_count,
+        redis_connected=redis_ok,
+        models_loaded=model_manager.loaded_models,
     )
 
 
@@ -119,7 +123,7 @@ async def submit_job(request: JobSubmitRequest):
         job_store.update_status(job_id, JobStatus.PROCESSING)
 
         start = time.time()
-        result = run_mock_inference(request.model_type, request.input_text)
+        result = run_inference(request.model_type, request.input_text)
         elapsed_ms = (time.time() - start) * 1000
 
         job_store.set_result(job_id, result, elapsed_ms)

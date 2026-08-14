@@ -4,7 +4,7 @@ NexusInfer — Celery Application
 Configures the Celery distributed task queue backed by Redis.
 This module is the entry point for Celery workers:
 
-    celery -A app.workers.celery_app worker --loglevel=info
+    celery -A app.workers.celery_app worker --loglevel=info -Q inference
 
 Architecture:
     FastAPI (producer) → Redis (broker) → Celery Worker (consumer)
@@ -17,6 +17,7 @@ database numbers (0 and 1) to keep concerns separated.
 
 import logging
 from celery import Celery
+from celery.signals import worker_process_init
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,25 @@ celery_app.conf.update(
     # Default queue
     task_default_queue="default",
 )
+
+# ──────────────────────────── Worker Init Signal ────────────────────────────
+
+
+@worker_process_init.connect
+def preload_models(**kwargs):
+    """
+    Pre-load all ML models when a Celery worker process starts.
+
+    This eliminates cold-start latency on the first inference request.
+    Each worker process gets its own copy of the models in memory.
+    Called automatically by Celery via the worker_process_init signal.
+    """
+    from app.services.model_manager import model_manager
+
+    logger.info("Worker process starting — pre-loading ML models...")
+    model_manager.load_all()
+    logger.info(f"Worker ready | models={model_manager.loaded_models}")
+
 
 # ──────────────────────────── Auto-discover Tasks ────────────────────────────
 

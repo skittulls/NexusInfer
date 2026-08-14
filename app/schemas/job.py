@@ -116,3 +116,6 @@ class HealthResponse(BaseModel):
     version: str
     uptime_seconds: float
     jobs_in_queue: int = 0
+    redis_connected: bool = False
+    models_loaded: list[str] = []
+

@@ -10,11 +10,8 @@ Task Lifecycle:
     3. API dispatches `run_inference_task.delay(job_id, model_type, input_text)`
     4. Celery worker picks up the task from the 'inference' queue
     5. Worker transitions job → PROCESSING
-    6. Worker runs the inference engine
+    6. Worker runs the real HuggingFace inference engine
     7. Worker transitions job → COMPLETED (with result) or FAILED (with error)
-
-The task operates on the shared job store. In Day 1-3, this is the
-in-memory dict. From Day 4 onwards, it's PostgreSQL via SQLAlchemy.
 """
 
 import time
@@ -24,7 +21,6 @@ from celery import Task
 from app.workers.celery_app import celery_app
 from app.schemas.job import JobStatus, ModelType
 from app.services.job_service import job_store
-from app.services.inference import run_mock_inference
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +30,8 @@ class InferenceTask(Task):
     Custom Celery Task base class for inference.
 
     Provides lifecycle hooks for logging and error handling.
-    On Day 3, this is extended to manage ML model loading
-    (load once per worker process, reuse across tasks).
+    The model_manager is accessed via the singleton in inference.py,
+    which was pre-loaded during worker_process_init.
     """
 
     name = "app.workers.tasks.run_inference_task"
@@ -68,6 +64,9 @@ def run_inference_task(self, job_id: str, model_type: str, input_text: str):
     """
     Execute ML inference as a background Celery task.
 
+    Uses real HuggingFace transformer models via the inference engine.
+    Models are pre-loaded in worker memory (no cold-start per request).
+
     Args:
         job_id: UUID of the job to process.
         model_type: The ML model to use (sentiment, summarization, ner).
@@ -76,6 +75,8 @@ def run_inference_task(self, job_id: str, model_type: str, input_text: str):
     Returns:
         dict with job_id, status, and processing_time_ms.
     """
+    from app.services.inference import run_inference
+
     logger.info(
         f"Worker picked up job {job_id} | model={model_type} | "
         f"input_len={len(input_text)} | attempt={self.request.retries + 1}"
@@ -85,10 +86,10 @@ def run_inference_task(self, job_id: str, model_type: str, input_text: str):
     job_store.update_status(job_id, JobStatus.PROCESSING)
 
     try:
-        # ── Run inference ──
+        # ── Run real ML inference ──
         start = time.time()
         model_enum = ModelType(model_type)
-        result = run_mock_inference(model_enum, input_text)
+        result = run_inference(model_enum, input_text)
         elapsed_ms = (time.time() - start) * 1000
 
         # ── Store result ──
