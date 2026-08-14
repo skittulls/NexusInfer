@@ -1,0 +1,26 @@
+# ──────────────────────────── Build Stage ────────────────────────────
+FROM python:3.11-slim AS base
+
+WORKDIR /app
+
+# System dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (cached layer)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY app/ ./app/
+
+# ──────────────────────────── Model Pre-load ────────────────────────────
+# Pre-download HuggingFace models during image build so the container
+# doesn't have to download 1.5GB of weights on first boot.
+# This uses the same ModelManager logic we built earlier.
+RUN python -c "from app.services.model_manager import model_manager; model_manager.load_all()"
+
+# ──────────────────────────── Runtime ────────────────────────────
+# Default command for the Celery worker
+CMD ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=info", "-Q", "inference", "--concurrency=4"]

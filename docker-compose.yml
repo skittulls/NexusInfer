@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  # ──────────────────────────── API Gateway ────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: nexusinfer-api
+    container_name: nexusinfer-api
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_NAME=NexusInfer
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - nexus-network
+    restart: unless-stopped
+
+  # ──────────────────────────── Celery Worker ────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: nexusinfer-worker
+    container_name: nexusinfer-worker
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - nexus-network
+    deploy:
+      # Easily scale workers: docker-compose up --scale worker=3
+      replicas: 1
+    restart: unless-stopped
+
+  # ──────────────────────────── Message Broker ────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: nexusinfer-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - nexus-network
+    restart: unless-stopped
+
+# ──────────────────────────── Networks ────────────────────────────
+networks:
+  nexus-network:
+    driver: bridge

@@ -177,8 +177,14 @@ NexusInfer/
 | Containerization | Docker, Docker Compose |
 | Testing | pytest, httpx |
 
-## Coming Soon
+## Roadmap
 
+- [x] FastAPI async REST API with Pydantic validation
+- [x] Redis-backed Celery distributed task queue
+- [x] HuggingFace Transformers inference (sentiment, summarization, NER)
+- [x] Singleton model caching + lazy loading
+- [x] Fault-tolerant task dispatch (late-ack, retries, graceful degradation)
+- [x] Containerized with Docker + Docker Compose
 - [ ] **Persistent Job Store** — PostgreSQL + SQLAlchemy ORM with Alembic migrations
 - [ ] **Locust Benchmarks** — Load testing with throughput and p99 latency reports
 - [ ] **Dynamic Batching** — Group concurrent requests to maximize GPU/CPU throughput
