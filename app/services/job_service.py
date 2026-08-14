@@ -1,20 +1,33 @@
 """
-NexusInfer — Job Service
+NexusInfer — Job Service (PostgreSQL / SQLAlchemy backed)
 
 Business logic layer for job management.
-Implements an in-memory job store for Day 1 (replaced with PostgreSQL on Day 4).
+Replaced the in-memory dict (Day 1) with a persistent SQLAlchemy session.
 
-This service is the single source of truth for job state transitions.
-All job mutations go through this layer, making it easy to swap the
-backing store without touching the API or worker code.
+This service is the single source of truth for all job state transitions.
+It is storage-agnostic from the caller's perspective — routes and workers
+interact through the same interface regardless of the backing store.
+
+Usage in FastAPI routes (dependency injection):
+    def submit_job(request: JobSubmitRequest, db: Session = Depends(get_db)):
+        service = JobService(db)
+        return service.create_job(request)
+
+Usage in Celery workers (context manager):
+    with get_db_session() as db:
+        service = JobService(db)
+        service.update_status(job_id, JobStatus.PROCESSING)
 """
 
 import uuid
-import time
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+
+from app.models.job import Job
 from app.schemas.job import (
     ModelType,
     JobStatus,
@@ -27,56 +40,67 @@ from app.schemas.job import (
 logger = logging.getLogger(__name__)
 
 
-class JobStore:
-    """
-    In-memory job store.
+def _to_response(job: Job) -> JobStatusResponse:
+    """Convert a SQLAlchemy Job ORM object to a Pydantic response model."""
+    return JobStatusResponse(
+        job_id=job.id,
+        status=job.status,
+        model_type=job.model_type,
+        input_text=job.input_text,
+        result=job.result,
+        error=job.error,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+        processing_time_ms=job.processing_time_ms,
+    )
 
-    Thread-safe for Day 1 usage with uvicorn's single-process mode.
-    Will be replaced with SQLAlchemy + PostgreSQL on Day 4.
+
+class JobService:
+    """
+    Persistent job store backed by SQLAlchemy.
+
+    Each instance is bound to a single database session.
+    Sessions are managed by the caller (FastAPI dependency or Celery context manager).
     """
 
-    def __init__(self):
-        self._jobs: dict[str, dict] = {}
+    def __init__(self, db: Session):
+        self.db = db
+
+    # ──────────────────────────── Create ────────────────────────────
 
     def create_job(self, request: JobSubmitRequest) -> JobSubmitResponse:
         """
-        Create a new job entry and return its ID.
-        The job starts in PENDING state.
+        Persist a new job in PENDING state and return its metadata.
         """
-        job_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
-
-        job_record = {
-            "job_id": job_id,
-            "status": JobStatus.PENDING,
-            "model_type": request.model_type,
-            "input_text": request.input_text,
-            "priority": request.priority,
-            "result": None,
-            "error": None,
-            "created_at": now,
-            "started_at": None,
-            "completed_at": None,
-            "processing_time_ms": None,
-        }
-
-        self._jobs[job_id] = job_record
-        logger.info(f"Job created: {job_id} | model={request.model_type.value}")
-
-        return JobSubmitResponse(
-            job_id=job_id,
+        job = Job(
+            id=str(uuid.uuid4()),
             status=JobStatus.PENDING,
-            message=f"Job submitted successfully. Model: {request.model_type.value}",
-            created_at=now,
+            model_type=request.model_type,
+            input_text=request.input_text,
+            priority=request.priority,
         )
 
-    def get_job(self, job_id: str) -> Optional[JobStatusResponse]:
-        """Retrieve a job by its ID. Returns None if not found."""
-        record = self._jobs.get(job_id)
-        if record is None:
-            return None
+        self.db.add(job)
+        self.db.flush()     # Write to DB, generate created_at via server_default
 
-        return JobStatusResponse(**record)
+        logger.info(f"Job created: {job.id} | model={request.model_type.value}")
+
+        return JobSubmitResponse(
+            job_id=job.id,
+            status=JobStatus.PENDING,
+            message=f"Job submitted successfully. Model: {request.model_type.value}",
+            created_at=job.created_at or datetime.now(timezone.utc),
+        )
+
+    # ──────────────────────────── Read ────────────────────────────
+
+    def get_job(self, job_id: str) -> Optional[JobStatusResponse]:
+        """Retrieve a job by ID. Returns None if not found."""
+        job = self.db.query(Job).filter(Job.id == job_id).first()
+        if job is None:
+            return None
+        return _to_response(job)
 
     def list_jobs(
         self,
@@ -85,85 +109,88 @@ class JobStore:
         status_filter: Optional[JobStatus] = None,
     ) -> JobListResponse:
         """List all jobs with pagination and optional status filtering."""
-        all_jobs = list(self._jobs.values())
+        query = self.db.query(Job)
 
-        # Apply status filter
         if status_filter:
-            all_jobs = [j for j in all_jobs if j["status"] == status_filter]
+            query = query.filter(Job.status == status_filter)
 
-        # Sort by creation time (newest first)
-        all_jobs.sort(key=lambda j: j["created_at"], reverse=True)
+        total = query.count()
 
-        total = len(all_jobs)
-        start = (page - 1) * page_size
-        end = start + page_size
-        page_jobs = all_jobs[start:end]
+        jobs = (
+            query
+            .order_by(Job.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
 
         return JobListResponse(
-            jobs=[JobStatusResponse(**j) for j in page_jobs],
+            jobs=[_to_response(j) for j in jobs],
             total=total,
             page=page,
             page_size=page_size,
         )
 
+    # ──────────────────────────── Update ────────────────────────────
+
     def update_status(self, job_id: str, status: JobStatus) -> bool:
         """Transition a job to a new status."""
-        if job_id not in self._jobs:
+        job = self.db.query(Job).filter(Job.id == job_id).first()
+        if job is None:
             return False
 
-        self._jobs[job_id]["status"] = status
+        job.status = status
 
         if status == JobStatus.PROCESSING:
-            self._jobs[job_id]["started_at"] = datetime.now(timezone.utc)
+            job.started_at = datetime.now(timezone.utc)
 
+        self.db.flush()
         logger.info(f"Job {job_id} → {status.value}")
         return True
 
-    def set_result(self, job_id: str, result: dict, processing_time_ms: float) -> bool:
+    def set_result(
+        self, job_id: str, result: dict, processing_time_ms: float
+    ) -> bool:
         """Mark a job as completed with its inference result."""
-        if job_id not in self._jobs:
+        job = self.db.query(Job).filter(Job.id == job_id).first()
+        if job is None:
             return False
 
-        now = datetime.now(timezone.utc)
-        self._jobs[job_id].update({
-            "status": JobStatus.COMPLETED,
-            "result": result,
-            "completed_at": now,
-            "processing_time_ms": processing_time_ms,
-        })
+        job.status = JobStatus.COMPLETED
+        job.result = result
+        job.completed_at = datetime.now(timezone.utc)
+        job.processing_time_ms = processing_time_ms
 
-        logger.info(
-            f"Job {job_id} completed in {processing_time_ms:.1f}ms"
-        )
+        self.db.flush()
+        logger.info(f"Job {job_id} completed in {processing_time_ms:.1f}ms")
         return True
 
     def set_failed(self, job_id: str, error: str) -> bool:
         """Mark a job as failed with an error message."""
-        if job_id not in self._jobs:
+        job = self.db.query(Job).filter(Job.id == job_id).first()
+        if job is None:
             return False
 
-        self._jobs[job_id].update({
-            "status": JobStatus.FAILED,
-            "error": error,
-            "completed_at": datetime.now(timezone.utc),
-        })
+        job.status = JobStatus.FAILED
+        job.error = error
+        job.completed_at = datetime.now(timezone.utc)
 
+        self.db.flush()
         logger.error(f"Job {job_id} failed: {error}")
         return True
+
+    # ──────────────────────────── Aggregates ────────────────────────────
 
     @property
     def pending_count(self) -> int:
         """Number of jobs currently in PENDING state."""
-        return sum(
-            1 for j in self._jobs.values() if j["status"] == JobStatus.PENDING
+        return (
+            self.db.query(func.count(Job.id))
+            .filter(Job.status == JobStatus.PENDING)
+            .scalar() or 0
         )
 
     @property
     def total_count(self) -> int:
-        """Total number of jobs in the store."""
-        return len(self._jobs)
-
-
-# ──────────────────── Singleton Instance ────────────────────
-# Replaced with dependency injection + DB session on Day 4.
-job_store = JobStore()
+        """Total number of jobs in the database."""
+        return self.db.query(func.count(Job.id)).scalar() or 0

@@ -42,6 +42,14 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Default Model: {settings.DEFAULT_MODEL}")
     logger.info("=" * 60)
 
+    # ── Create database tables ──
+    try:
+        from app.core.database import create_tables
+        create_tables()
+        logger.info("  Database: READY")
+    except Exception as e:
+        logger.error(f"  Database: FAILED ({e})")
+
     # ── Check Redis connectivity ──
     try:
         import redis

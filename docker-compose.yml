@@ -12,10 +12,13 @@ services:
       - "8000:8000"
     environment:
       - APP_NAME=NexusInfer
+      - DATABASE_URL=postgresql://nexus:nexus@postgres:5432/nexusinfer
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     networks:
       - nexus-network
@@ -29,15 +32,17 @@ services:
     image: nexusinfer-worker
     container_name: nexusinfer-worker
     environment:
+      - DATABASE_URL=postgresql://nexus:nexus@postgres:5432/nexusinfer
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     networks:
       - nexus-network
     deploy:
-      # Easily scale workers: docker-compose up --scale worker=3
       replicas: 1
     restart: unless-stopped
 
@@ -56,7 +61,32 @@ services:
       - nexus-network
     restart: unless-stopped
 
-# ──────────────────────────── Networks ────────────────────────────
+  # ──────────────────────────── Database ────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: nexusinfer-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=nexus
+      - POSTGRES_PASSWORD=nexus
+      - POSTGRES_DB=nexusinfer
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus -d nexusinfer"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - nexus-network
+    restart: unless-stopped
+
+# ──────────────────────────── Networks & Volumes ────────────────────────────
 networks:
   nexus-network:
     driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local

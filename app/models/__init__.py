@@ -1,1 +1,5 @@
-"""Models package (SQLAlchemy ORM models — populated on Day 4)."""
+"""Models package — exports ORM models."""
+
+from app.models.job import Job
+
+__all__ = ["Job"]

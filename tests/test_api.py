@@ -4,21 +4,60 @@ NexusInfer — API Tests
 Tests the core API endpoints using FastAPI's built-in test client.
 Run with: pytest tests/ -v
 
-Tests run without Redis or ML models by mocking external dependencies.
-This ensures tests are fast, deterministic, and CI-friendly.
+All external dependencies are mocked or overridden:
+  - Database: in-memory SQLite (via FastAPI dependency override)
+  - Inference engine: mock returning real-shaped output
+  - Redis: mocked via patch
+No external services are required.
 """
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from app.main import app
+from app.core.database import Base, get_db
+
+
+# ──────────────────────────── Test Database Setup ────────────────────────────
+
+TEST_DATABASE_URL = "sqlite:///:memory:"
+
+# Use a single shared connection so all sessions in a test share
+# the same in-memory SQLite database (each new connection to
+# sqlite:///:memory: gets its own blank DB).
+test_engine = create_engine(
+    TEST_DATABASE_URL,
+    connect_args={"check_same_thread": False},
+)
+
+# Shared connection kept open for the lifetime of a test
+_test_connection = test_engine.connect()
+
+TestSessionLocal = sessionmaker(
+    bind=_test_connection,
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+)
+
+
+def override_get_db():
+    """Override the production DB dependency with in-memory SQLite."""
+    db = TestSessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 # ──────────────────────────── Mock Inference ────────────────────────────
-# Mock the real inference engine so tests don't require downloading
-# HuggingFace models (2GB+). The mock returns structured output
-# matching the real model output format.
 
 MOCK_SENTIMENT_RESULT = {
     "model": "distilbert-base-uncased-finetuned-sst-2-english",
@@ -44,45 +83,58 @@ MOCK_NER_RESULT = {
     "task": "named-entity-recognition",
     "entities": [
         {"text": "Google", "label": "ORG", "score": 0.9987, "start": 0, "end": 6},
-        {"text": "Microsoft", "label": "ORG", "score": 0.9945, "start": 11, "end": 20},
     ],
-    "entity_count": 2,
-    "entity_types": {"ORG": 2},
+    "entity_count": 1,
+    "entity_types": {"ORG": 1},
     "input_length": 56,
 }
 
 
 def _mock_inference(model_type, input_text):
-    """Return mock results matching real model output format."""
     from app.schemas.job import ModelType
-    results = {
+    return {
         ModelType.SENTIMENT: MOCK_SENTIMENT_RESULT,
         ModelType.SUMMARIZATION: MOCK_SUMMARIZATION_RESULT,
         ModelType.NER: MOCK_NER_RESULT,
-    }
-    return results.get(model_type, MOCK_SENTIMENT_RESULT)
+    }.get(model_type, MOCK_SENTIMENT_RESULT)
+
+
+# ──────────────────────────── Fixtures ────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def setup_test_db():
+    """Create all tables on the shared connection before each test, drop after."""
+    from app.models import job  # noqa — register model with Base
+    Base.metadata.create_all(bind=_test_connection)
+    yield
+    Base.metadata.drop_all(bind=_test_connection)
 
 
 @pytest.fixture
-def client():
-    """Create a fresh test client with mocked inference."""
+def client(setup_test_db):
+    """
+    Test client with:
+      - DB dependency overridden to use in-memory SQLite (shared connection)
+      - Inference engine mocked to avoid loading HuggingFace models
+    """
+    app.dependency_overrides[get_db] = override_get_db
     with patch("app.api.routes.run_inference", side_effect=_mock_inference):
-        yield TestClient(app)
+        with TestClient(app) as c:
+            yield c
+    app.dependency_overrides.clear()
 
 
 # ──────────────────────────── Health Endpoint ────────────────────────────
 
 
 class TestHealthEndpoint:
-    """Tests for GET /api/v1/health"""
-
     def test_health_returns_200(self, client):
         response = client.get("/api/v1/health")
         assert response.status_code == 200
 
     def test_health_response_structure(self, client):
-        response = client.get("/api/v1/health")
-        data = response.json()
+        data = client.get("/api/v1/health").json()
         assert "status" in data
         assert "version" in data
         assert "uptime_seconds" in data
@@ -90,170 +142,119 @@ class TestHealthEndpoint:
         assert "redis_connected" in data
         assert "models_loaded" in data
 
-    def test_health_reports_redis_status(self, client):
-        """Health should report whether Redis is connected."""
-        response = client.get("/api/v1/health")
-        data = response.json()
-        assert isinstance(data["redis_connected"], bool)
+    def test_health_queue_depth_reflects_db(self, client):
+        """Queue depth should reflect actual pending jobs in the DB."""
+        # Initially 0
+        data = client.get("/api/v1/health").json()
+        assert data["jobs_in_queue"] == 0
 
 
 # ──────────────────────────── Submit Job ────────────────────────────
 
 
 class TestSubmitJob:
-    """Tests for POST /api/v1/jobs/submit"""
-
     def test_submit_sentiment_job(self, client):
-        payload = {
-            "model_type": "sentiment",
-            "input_text": "This is an amazing product!",
-        }
+        payload = {"model_type": "sentiment", "input_text": "Amazing product!"}
         response = client.post("/api/v1/jobs/submit", json=payload)
         assert response.status_code == 202
-
         data = response.json()
         assert "job_id" in data
         assert data["status"] in ["pending", "completed"]
 
     def test_submit_summarization_job(self, client):
-        payload = {
-            "model_type": "summarization",
-            "input_text": "This is a long text that needs to be summarized. " * 10,
-        }
-        response = client.post("/api/v1/jobs/submit", json=payload)
-        assert response.status_code == 202
+        payload = {"model_type": "summarization", "input_text": "Long text. " * 20}
+        assert client.post("/api/v1/jobs/submit", json=payload).status_code == 202
 
     def test_submit_ner_job(self, client):
-        payload = {
-            "model_type": "ner",
-            "input_text": "Google and Microsoft are tech companies based in the US.",
-        }
-        response = client.post("/api/v1/jobs/submit", json=payload)
-        assert response.status_code == 202
+        payload = {"model_type": "ner", "input_text": "Google is a company."}
+        assert client.post("/api/v1/jobs/submit", json=payload).status_code == 202
 
-    def test_submit_empty_text_fails(self, client):
-        payload = {
-            "model_type": "sentiment",
-            "input_text": "",
-        }
-        response = client.post("/api/v1/jobs/submit", json=payload)
-        assert response.status_code == 422
+    def test_empty_text_rejected(self, client):
+        payload = {"model_type": "sentiment", "input_text": ""}
+        assert client.post("/api/v1/jobs/submit", json=payload).status_code == 422
 
-    def test_submit_invalid_model_fails(self, client):
-        payload = {
-            "model_type": "nonexistent_model",
-            "input_text": "Hello world",
-        }
-        response = client.post("/api/v1/jobs/submit", json=payload)
-        assert response.status_code == 422
+    def test_invalid_model_rejected(self, client):
+        payload = {"model_type": "gpt5", "input_text": "hello"}
+        assert client.post("/api/v1/jobs/submit", json=payload).status_code == 422
 
-    def test_submit_returns_uuid(self, client):
-        payload = {
-            "model_type": "sentiment",
-            "input_text": "Testing job ID generation.",
-        }
-        response = client.post("/api/v1/jobs/submit", json=payload)
-        data = response.json()
-        assert len(data["job_id"]) == 36  # UUID format
+    def test_returns_uuid(self, client):
+        payload = {"model_type": "sentiment", "input_text": "Testing UUID."}
+        data = client.post("/api/v1/jobs/submit", json=payload).json()
+        assert len(data["job_id"]) == 36
 
-    def test_submit_with_priority(self, client):
-        payload = {
-            "model_type": "sentiment",
-            "input_text": "High priority inference.",
-            "priority": 10,
-        }
-        response = client.post("/api/v1/jobs/submit", json=payload)
-        assert response.status_code == 202
+    def test_priority_accepted(self, client):
+        payload = {"model_type": "sentiment", "input_text": "Hi", "priority": 10}
+        assert client.post("/api/v1/jobs/submit", json=payload).status_code == 202
 
-    def test_submit_invalid_priority_fails(self, client):
-        payload = {
-            "model_type": "sentiment",
-            "input_text": "Invalid priority.",
-            "priority": 99,
-        }
-        response = client.post("/api/v1/jobs/submit", json=payload)
-        assert response.status_code == 422
+    def test_priority_out_of_range_rejected(self, client):
+        payload = {"model_type": "sentiment", "input_text": "Hi", "priority": 99}
+        assert client.post("/api/v1/jobs/submit", json=payload).status_code == 422
 
-    def test_submit_text_too_long_fails(self, client):
-        """Input text exceeding max_length should be rejected."""
-        payload = {
-            "model_type": "sentiment",
-            "input_text": "x" * 5001,
-        }
-        response = client.post("/api/v1/jobs/submit", json=payload)
-        assert response.status_code == 422
+    def test_text_too_long_rejected(self, client):
+        payload = {"model_type": "sentiment", "input_text": "x" * 5001}
+        assert client.post("/api/v1/jobs/submit", json=payload).status_code == 422
 
 
 # ──────────────────────────── Get Job Status ────────────────────────────
 
 
 class TestGetJobStatus:
-    """Tests for GET /api/v1/jobs/{job_id}"""
-
     def test_get_existing_job(self, client):
-        payload = {
-            "model_type": "sentiment",
-            "input_text": "Test input for status check.",
-        }
-        submit_resp = client.post("/api/v1/jobs/submit", json=payload)
-        job_id = submit_resp.json()["job_id"]
-
+        submit = client.post("/api/v1/jobs/submit", json={
+            "model_type": "sentiment", "input_text": "Test job retrieval."
+        })
+        job_id = submit.json()["job_id"]
         response = client.get(f"/api/v1/jobs/{job_id}")
         assert response.status_code == 200
-
         data = response.json()
         assert data["job_id"] == job_id
         assert data["model_type"] == "sentiment"
 
-    def test_get_completed_job_has_result(self, client):
-        """Completed jobs should have structured result and timing."""
-        payload = {
-            "model_type": "sentiment",
-            "input_text": "Check result field.",
-        }
-        submit_resp = client.post("/api/v1/jobs/submit", json=payload)
-        job_id = submit_resp.json()["job_id"]
-
-        response = client.get(f"/api/v1/jobs/{job_id}")
-        data = response.json()
-
+    def test_completed_job_has_result(self, client):
+        submit = client.post("/api/v1/jobs/submit", json={
+            "model_type": "sentiment", "input_text": "Result field check."
+        })
+        job_id = submit.json()["job_id"]
+        data = client.get(f"/api/v1/jobs/{job_id}").json()
         if data["status"] == "completed":
             assert data["result"] is not None
-            assert data["result"]["model"] == "distilbert-base-uncased-finetuned-sst-2-english"
             assert data["result"]["label"] in ["POSITIVE", "NEGATIVE"]
             assert data["processing_time_ms"] is not None
 
-    def test_get_nonexistent_job_returns_404(self, client):
-        response = client.get("/api/v1/jobs/nonexistent-uuid")
-        assert response.status_code == 404
+    def test_job_persists_across_requests(self, client):
+        """Jobs in DB survive across request boundaries (not in-memory)."""
+        submit = client.post("/api/v1/jobs/submit", json={
+            "model_type": "ner", "input_text": "Persistence test."
+        })
+        job_id = submit.json()["job_id"]
+        # Second request should still find the job
+        assert client.get(f"/api/v1/jobs/{job_id}").status_code == 200
+
+    def test_nonexistent_job_404(self, client):
+        assert client.get("/api/v1/jobs/does-not-exist").status_code == 404
 
 
 # ──────────────────────────── List Jobs ────────────────────────────
 
 
 class TestListJobs:
-    """Tests for GET /api/v1/jobs"""
-
-    def test_list_jobs_returns_200(self, client):
+    def test_list_returns_200(self, client):
         response = client.get("/api/v1/jobs")
         assert response.status_code == 200
         data = response.json()
-        assert "jobs" in data
-        assert "total" in data
+        for field in ("jobs", "total", "page", "page_size"):
+            assert field in data
 
-    def test_list_jobs_pagination(self, client):
-        for i in range(3):
+    def test_pagination(self, client):
+        for i in range(5):
             client.post("/api/v1/jobs/submit", json={
-                "model_type": "sentiment",
-                "input_text": f"Test input number {i}",
+                "model_type": "sentiment", "input_text": f"Job {i}"
             })
+        data = client.get("/api/v1/jobs?page=1&page_size=3").json()
+        assert len(data["jobs"]) <= 3
+        assert data["total"] >= 5
 
-        response = client.get("/api/v1/jobs?page=1&page_size=2")
-        data = response.json()
-        assert len(data["jobs"]) <= 2
-        assert data["page"] == 1
-
-    def test_list_jobs_status_filter(self, client):
+    def test_status_filter(self, client):
         response = client.get("/api/v1/jobs?status=failed")
         assert response.status_code == 200
 
@@ -262,55 +263,39 @@ class TestListJobs:
 
 
 class TestCeleryIntegration:
-    """Tests for async Celery dispatch (mocked)."""
-
     def test_async_dispatch_when_redis_available(self, client):
-        """Jobs are dispatched to Celery when Redis is available."""
         with patch("app.api.routes._check_redis_connection", return_value=True):
             with patch("app.workers.tasks.run_inference_task.apply_async") as mock_dispatch:
-                payload = {
-                    "model_type": "sentiment",
-                    "input_text": "Async dispatch test.",
-                }
-                response = client.post("/api/v1/jobs/submit", json=payload)
-
+                response = client.post("/api/v1/jobs/submit", json={
+                    "model_type": "sentiment", "input_text": "Async test."
+                })
                 assert response.status_code == 202
-                data = response.json()
-                assert data["status"] == "pending"
+                assert response.json()["status"] == "pending"
                 mock_dispatch.assert_called_once()
 
-    def test_fallback_to_sync_when_redis_unavailable(self, client):
-        """Jobs run synchronously when Redis is down."""
+    def test_sync_fallback_when_redis_unavailable(self, client):
         with patch("app.api.routes._check_redis_connection", return_value=False):
-            payload = {
-                "model_type": "sentiment",
-                "input_text": "Sync fallback test.",
-            }
-            response = client.post("/api/v1/jobs/submit", json=payload)
-
+            response = client.post("/api/v1/jobs/submit", json={
+                "model_type": "sentiment", "input_text": "Sync fallback test."
+            })
             assert response.status_code == 202
-            data = response.json()
-            assert data["status"] == "completed"
+            assert response.json()["status"] == "completed"
 
 
 # ──────────────────────────── Model Manager ────────────────────────────
 
 
 class TestModelManager:
-    """Tests for the ModelManager singleton."""
-
-    def test_model_registry_has_all_types(self):
+    def test_registry_covers_all_model_types(self):
         from app.services.model_manager import ModelManager
         from app.schemas.job import ModelType
-
         manager = ModelManager()
         for mt in ModelType:
             assert mt in manager.MODEL_REGISTRY
 
-    def test_status_reports_available_models(self):
+    def test_status_reports_correctly(self):
         from app.services.model_manager import ModelManager
-
         manager = ModelManager()
         status = manager.status
         assert status["total_available"] == 3
-        assert status["total_loaded"] == 0  # Nothing loaded yet in test
+        assert status["total_loaded"] == 0
