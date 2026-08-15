@@ -16,13 +16,13 @@ Built with **FastAPI**, **Celery**, **Redis**, **HuggingFace Transformers**, **P
                           └──────────────────────────────────────┘
 
 ┌──────────┐    HTTP     ┌──────────────────┐    ENQUEUE    ┌──────────────┐
-│          │ ─────────►  │   FastAPI API     │ ───────────►  │    Redis     │
+│          │ ─────────►  │   FastAPI API    │  ───────────► │    Redis     │
 │  Client  │             │   Gateway        │               │   (Broker)   │
 │          │ ◄─────────  │   /api/v1/...    │               │              │
 └──────────┘   JSON      └────────┬─────────┘               └──────┬───────┘
-                                  │                                 │
-                                  │ READ                      CONSUME│
-                                  ▼                                 ▼
+                                  │                                │
+                                  │ READ                   CONSUME │
+                                  ▼                                ▼
                           ┌──────────────────┐          ┌───────────────────┐
                           │   PostgreSQL     │ ◄──────  │  Celery Workers   │
                           │   (Job Store)    │  WRITE   │  ┌─────────────┐  │
