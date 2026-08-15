@@ -186,7 +186,7 @@ NexusInfer/
 - [x] Fault-tolerant task dispatch (late-ack, retries, graceful degradation)
 - [x] Containerized with Docker + Docker Compose
 - [x] **Persistent Job Store** — PostgreSQL + SQLAlchemy ORM with Alembic migrations
-- [ ] **Locust Benchmarks** — Load testing with throughput and p99 latency reports
+- [x] **Locust Benchmarks** — Load testing with throughput and p99 latency reports
 - [ ] **Dynamic Batching** — Group concurrent requests to maximize GPU/CPU throughput
 
 ## License

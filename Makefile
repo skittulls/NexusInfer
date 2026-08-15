@@ -69,6 +69,10 @@ test:
 test-cov:
 	python -m pytest tests/ -v --cov=app --cov-report=term-missing
 
+## Run Locust benchmarks (requires running API)
+benchmark:
+	locust -f benchmarks/locustfile.py --headless -u 100 -r 10 --run-time 1m --host http://localhost:8000
+
 # ──────────────────────────── Utilities ────────────────────────────
 
 ## Submit a sample sentiment job
